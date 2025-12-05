@@ -66,8 +66,9 @@ app.set('trust proxy', 1);
 // Serve static files
 app.use('/sprites', express.static('public/sprites'));
 
-// MongoDB Connection
-mongoose.connect('mongodb://localhost:27017/hls-monitor')
+// MongoDB Connection (uses env var for cloud, localhost for dev)
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/hls-monitor';
+mongoose.connect(MONGODB_URI)
     .then(() => console.log('MongoDB Connected'))
     .catch(err => console.error('MongoDB Connection Error:', err));
 
