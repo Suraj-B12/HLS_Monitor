@@ -90,8 +90,8 @@ const StreamSchema = new mongoose.Schema({
 
 // Limit errors to 10
 StreamSchema.pre('save', function () {
-    if (this.streamErrors && this.streamErrors.length > 10) {
-        this.streamErrors = this.streamErrors.slice(-10);
+    if (this.streamErrors && this.streamErrors.length > 250) {
+        this.streamErrors = this.streamErrors.slice(-250);
     }
 });
 

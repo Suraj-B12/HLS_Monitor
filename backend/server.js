@@ -75,9 +75,30 @@ mongoose.connect('mongodb://localhost:27017/hls-monitor')
 const Stream = require('./models/Stream');
 const AuditLog = require('./models/AuditLog');
 
+// Parse User-Agent to get device name using ua-parser-js
+const UAParser = require('ua-parser-js');
+
+function parseDeviceName(userAgent) {
+    if (!userAgent) return 'Unknown Device';
+
+    const parser = new UAParser(userAgent);
+    const result = parser.getResult();
+
+    const browser = result.browser.name || 'Unknown Browser';
+    const os = result.os.name || 'Unknown OS';
+    const device = result.device.model || result.device.type || '';
+
+    // Format: "Chrome on Windows 10" or "Safari on iPhone 14"
+    if (device) {
+        return `${browser} on ${device}`;
+    }
+    return `${browser} on ${os}`;
+}
+
 // Audit Logger Helper
 async function logAction(action, streamData, req) {
     try {
+        const userAgent = req.get('User-Agent');
         await AuditLog.create({
             action,
             streamId: streamData._id || streamData.id,
@@ -85,7 +106,8 @@ async function logAction(action, streamData, req) {
             streamUrl: streamData.url,
             details: streamData.details || null,
             ipAddress: req.ip || req.connection?.remoteAddress,
-            userAgent: req.get('User-Agent')
+            userAgent: userAgent,
+            deviceName: parseDeviceName(userAgent)
         });
     } catch (err) {
         console.error('Audit log error:', err.message);

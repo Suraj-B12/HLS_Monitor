@@ -15,6 +15,7 @@ const AuditLogSchema = new mongoose.Schema({
     details: String,
     ipAddress: String,
     userAgent: String,
+    deviceName: String,
     timestamp: {
         type: Date,
         default: Date.now
