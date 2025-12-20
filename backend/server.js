@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -141,6 +142,14 @@ app.get('/api', (req, res) => {
 
 // ===== STREAM ROUTES =====
 
+// ObjectId validation middleware - prevents crashes from bad IDs
+const validateObjectId = (req, res, next) => {
+    if (req.params.id && !mongoose.Types.ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid stream ID format' });
+    }
+    next();
+};
+
 // Input validation for adding streams
 const validateStream = [
     body('url')
@@ -191,7 +200,7 @@ app.get('/api/streams', async (req, res) => {
 });
 
 // Get single stream (exclude errors - fetched separately via pagination)
-app.get('/api/streams/:id', async (req, res) => {
+app.get('/api/streams/:id', validateObjectId, async (req, res) => {
     try {
         const stream = await Stream.findById(req.params.id).select('-streamErrors');
         if (!stream) return res.status(404).json({ error: 'Not found' });
@@ -202,7 +211,7 @@ app.get('/api/streams/:id', async (req, res) => {
 });
 
 // Get paginated errors for a stream (lazy loading)
-app.get('/api/streams/:id/errors', async (req, res) => {
+app.get('/api/streams/:id/errors', validateObjectId, async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
@@ -230,7 +239,7 @@ app.get('/api/streams/:id/errors', async (req, res) => {
 });
 
 // Delete stream - SECURE
-app.delete('/api/streams/:id', async (req, res) => {
+app.delete('/api/streams/:id', validateObjectId, async (req, res) => {
     try {
         const { confirmation } = req.body;
 
@@ -256,42 +265,37 @@ app.delete('/api/streams/:id', async (req, res) => {
     }
 });
 
-// Get available log dates
-app.get('/api/streams/:id/logs/dates', async (req, res) => {
+// Get available log dates (last 7 days)
+app.get('/api/streams/:id/logs/dates', validateObjectId, async (req, res) => {
     try {
-        const stream = await Stream.findById(req.params.id).select('streamErrors createdAt');
+        const stream = await Stream.findById(req.params.id).select('streamErrors');
         if (!stream) return res.status(404).json({ error: 'Not found' });
 
-        const dates = new Set();
+        // Generate last 7 days
+        const dates = [];
+        const today = new Date();
+        for (let i = 0; i < 7; i++) {
+            const date = new Date(today);
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toISOString().split('T')[0];
 
-        // Add creation date
-        if (stream.createdAt) {
-            dates.add(new Date(stream.createdAt).toISOString().split('T')[0]);
+            // Count errors for this date
+            const errorCount = (stream.streamErrors || []).filter(err => {
+                if (!err.date) return false;
+                return new Date(err.date).toISOString().split('T')[0] === dateStr;
+            }).length;
+
+            dates.push({ date: dateStr, errorCount });
         }
 
-        // Add error dates
-        if (stream.streamErrors) {
-            stream.streamErrors.forEach(err => {
-                if (err.date) {
-                    dates.add(new Date(err.date).toISOString().split('T')[0]);
-                }
-            });
-        }
-
-        // Always add today
-        dates.add(new Date().toISOString().split('T')[0]);
-
-        // Convert to array and sort descending
-        const sortedDates = Array.from(dates).sort((a, b) => b.localeCompare(a));
-
-        res.json(sortedDates);
+        res.json(dates);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // Download stream log (Human-Readable Format)
-app.get('/api/streams/:id/log', async (req, res) => {
+app.get('/api/streams/:id/log', validateObjectId, async (req, res) => {
     try {
         const stream = await Stream.findById(req.params.id);
         if (!stream) return res.status(404).json({ error: 'Not found' });
@@ -417,7 +421,7 @@ app.get('/api/streams/:id/log', async (req, res) => {
 // ===== METRICS HISTORY ROUTES =====
 
 // Get metrics history for a stream (for graphs) - returns ALL data from start
-app.get('/api/streams/:id/metrics', async (req, res) => {
+app.get('/api/streams/:id/metrics', validateObjectId, async (req, res) => {
     try {
         const metrics = await MetricsHistory.find({ streamId: req.params.id })
             .sort({ timestamp: 1 });  // No limit - get all historical data

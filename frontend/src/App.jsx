@@ -9,16 +9,22 @@ import { audioSynth } from './utils/AudioSynth';
 
 const socket = io('/', { path: '/socket.io' });
 
-// Health Helper
+// Health Helper - Based on status and recent SIGNIFICANT errors
 function calculateHealth(stream) {
     let score = 100;
     const health = stream.health || {};
-    if (health.isStale) score -= 30;
-    if (health.sequenceJumps > 0) score -= Math.min(health.sequenceJumps * 5, 20);
-    if (health.sequenceResets > 0) score -= Math.min(health.sequenceResets * 10, 30);
-    if (health.totalErrors > 0) score -= Math.min(health.totalErrors * 2, 20);
-    if (stream.status === 'error') score -= 40;
-    if (stream.status === 'offline') score -= 50;
+
+    // Status penalties (hard caps)
+    if (stream.status === 'error') return 60;
+    if (stream.status === 'offline') return 50;
+    if (health.isStale) score -= 15;
+
+    // Recent errors penalty - now only counts significant gaps (3+)
+    const errors = health.recentErrors || 0;
+    if (errors > 0) {
+        score -= Math.min(errors * 3, 30);
+    }
+
     return Math.max(0, Math.min(100, score));
 }
 

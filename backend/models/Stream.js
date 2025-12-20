@@ -40,7 +40,13 @@ const StreamSchema = new mongoose.Schema({
         playlistType: { type: String, default: 'LIVE' },
 
         totalErrors: { type: Number, default: 0 },
-        timeSinceLastError: { type: Number, default: 0 }
+        timeSinceLastError: { type: Number, default: 0 },
+
+        // --- SLIDING WINDOW METRICS (last 100 segments) ---
+        recentErrors: { type: Number, default: 0 },
+        recentSequenceJumps: { type: Number, default: 0 },
+        recentSequenceResets: { type: Number, default: 0 },
+        lastErrorTime: { type: Date, default: null }
     },
 
     // --- DEEP VIDEO/AUDIO STATS ---
@@ -62,7 +68,12 @@ const StreamSchema = new mongoose.Schema({
             codec: String,
             channels: Number,
             sampleRate: Number,
-            bitRate: Number
+            bitRate: Number,
+            // --- ENHANCED AUDIO METRICS ---
+            peakDb: Number,           // Peak decibel level
+            avgDb: Number,            // Average decibel level
+            channelLayout: String,    // Human-readable layout (Stereo, 5.1, etc.)
+            isSilent: Boolean         // Silence detection flag
         },
         container: {
             formatName: String,
@@ -73,6 +84,8 @@ const StreamSchema = new mongoose.Schema({
     },
 
     // --- ERROR LOG ---
+    // NOTE: No cap anymore - relying on 7-day TTL in MetricsHistory for cleanup
+    // Errors older than 7 days are cleaned by MongoDB TTL index automatically
     streamErrors: [{
         eid: String,
         date: { type: Date, default: Date.now },
@@ -88,10 +101,26 @@ const StreamSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
-// Limit errors to 1000
+// Auto-cleanup: Remove errors older than 7 days on save
+// Wrapped in try-catch to prevent cleanup failures from blocking saves
 StreamSchema.pre('save', function () {
-    if (this.streamErrors && this.streamErrors.length > 1000) {
-        this.streamErrors = this.streamErrors.slice(-1000);
+    try {
+        if (this.streamErrors && Array.isArray(this.streamErrors) && this.streamErrors.length > 0) {
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            this.streamErrors = this.streamErrors.filter(err => {
+                // Keep errors that have a valid date within the last 7 days
+                if (!err || !err.date) return false;
+                try {
+                    const errDate = new Date(err.date);
+                    return !isNaN(errDate.getTime()) && errDate > sevenDaysAgo;
+                } catch {
+                    return false; // Remove malformed errors
+                }
+            });
+        }
+    } catch (err) {
+        // If cleanup fails, log but don't block the save
+        console.error('[STREAM] Error cleanup failed:', err.message);
     }
 });
 

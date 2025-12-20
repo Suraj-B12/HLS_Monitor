@@ -2,19 +2,25 @@ import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import axios from 'axios';
-import { ArrowLeft, Download, Activity, Zap, Volume2, Box, AlertTriangle, CheckCircle, Clock, RefreshCw, Radio, TrendingUp } from 'lucide-react';
+import { ArrowLeft, Download, Activity, Zap, Volume2, Box, AlertTriangle, CheckCircle, Clock, RefreshCw, Radio, TrendingUp, Play } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Area, AreaChart } from 'recharts';
 
-// Health Score Calculation
+// Health Score Calculation - Based on status and recent SIGNIFICANT errors
 function calculateHealthScore(stream) {
     let score = 100;
     const health = stream.health || {};
-    if (health.isStale) score -= 30;
-    if (health.sequenceJumps > 0) score -= Math.min(health.sequenceJumps * 5, 20);
-    if (health.sequenceResets > 0) score -= Math.min(health.sequenceResets * 10, 30);
-    if (health.totalErrors > 0) score -= Math.min(health.totalErrors * 2, 20);
-    if (stream.status === 'error') score -= 40;
-    if (stream.status === 'offline') score -= 50;
+
+    // Status penalties (hard caps)
+    if (stream.status === 'error') return 60;
+    if (stream.status === 'offline') return 50;
+    if (health.isStale) score -= 15;
+
+    // Recent errors penalty - now only counts significant gaps (3+)
+    const errors = health.recentErrors || 0;
+    if (errors > 0) {
+        score -= Math.min(errors * 3, 30);
+    }
+
     return Math.max(0, Math.min(100, score));
 }
 
@@ -22,6 +28,16 @@ function getHealthColor(score) {
     if (score >= 80) return { bg: 'bg-emerald-500', text: 'text-emerald-400', label: 'HEALTHY' };
     if (score >= 50) return { bg: 'bg-amber-500', text: 'text-amber-400', label: 'WARNING' };
     return { bg: 'bg-rose-500', text: 'text-rose-400', label: 'CRITICAL' };
+}
+
+// Format dB level for display - converts negative dB to user-friendly format
+// Audio dB values are typically negative (0 dB = max, -∞ = silence)
+// We display as absolute value with "dBFS" (decibels Full Scale) suffix
+function formatDbLevel(dbValue) {
+    if (dbValue == null || !isFinite(dbValue)) return '-';
+    // Convert to absolute value for cleaner display
+    const absValue = Math.abs(dbValue).toFixed(1);
+    return `${absValue} dBFS`;
 }
 
 // Signal Strength Indicator
@@ -271,7 +287,7 @@ const StreamDetail = () => {
                     </div>
                 </div>
 
-                <div>
+                <div className="flex flex-wrap gap-4">
                     <button
                         onClick={async () => {
                             setLoadingDates(true);
@@ -295,41 +311,122 @@ const StreamDetail = () => {
                         {loadingDates ? <RefreshCw className="animate-spin" size={18} /> : <Download size={18} />}
                         Download Daily Log
                     </button>
+
+                    {/* Play Stream Button - Opens HLS player in new tab (client-side only) */}
+                    <button
+                        onClick={() => {
+                            // Create a standalone HTML page with HLS.js player
+                            const playerHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${stream.name} - HLS Player</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0f; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        video { max-width: 100%; max-height: 100vh; background: #000; }
+        .error { color: #f87171; font-family: system-ui; text-align: center; padding: 2rem; }
+    </style>
+</head>
+<body>
+    <video id="video" controls autoplay></video>
+    <script>
+        const video = document.getElementById('video');
+        const url = '${stream.url}';
+        if (Hls.isSupported()) {
+            const hls = new Hls({
+                liveSyncDurationCount: 3,      // Start 3 segments from live edge
+                liveMaxLatencyDurationCount: 5 // Max 5 segments behind
+            });
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            // Seek to live edge when manifest is loaded
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                video.currentTime = video.duration || 0;
+                video.play();
+            });
+            hls.on(Hls.Events.ERROR, (e, data) => {
+                if (data.fatal) document.body.innerHTML = '<div class="error">Failed to load stream: ' + data.details + '</div>';
+            });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = url;
+        } else {
+            document.body.innerHTML = '<div class="error">HLS not supported in this browser</div>';
+        }
+    </script>
+</body>
+</html>`;
+                            const blob = new Blob([playerHtml], { type: 'text/html' });
+                            const playerUrl = URL.createObjectURL(blob);
+                            window.open(playerUrl, '_blank');
+                        }}
+                        className="mb-8 px-6 py-3 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 rounded-lg text-emerald-400 font-bold flex items-center gap-2 transition-colors"
+                    >
+                        <Play size={18} />
+                        Play Stream
+                    </button>
                 </div>
 
                 {/* Date Selection Modal */}
                 {isDateModalOpen && (
-                    <div className="fixed inset-0 bg-black/60 backdrop-blur-md flex items-center justify-center z-50 p-4">
-                        <div className="glass-panel w-full max-w-md p-6">
-                            <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
-                                <Clock className="text-primary" /> Select Log Date
-                            </h2>
-                            <p className="text-white/50 text-sm mb-6">Select a date to download the error log for that specific day.</p>
-
-                            <div className="grid grid-cols-2 gap-3 mb-6 max-h-60 overflow-y-auto pr-2">
-                                {availableDates.map(date => (
-                                    <button
-                                        key={date}
-                                        onClick={() => {
-                                            window.open(`/api/streams/${id}/log?date=${date}`, '_blank');
-                                            setIsDateModalOpen(false);
-                                        }}
-                                        className="px-4 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-left transition-all hover:border-primary/50 flex items-center justify-between group"
-                                    >
-                                        <span className="font-mono text-sm">{date}</span>
-                                        <Download size={14} className="opacity-0 group-hover:opacity-100 text-primary transition-opacity" />
-                                    </button>
-                                ))}
+                    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={() => setIsDateModalOpen(false)}>
+                        <div className="bg-slate-900/95 border border-white/10 rounded-2xl w-full max-w-sm p-6 shadow-2xl" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-3 mb-6">
+                                <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+                                    <Clock className="text-primary" size={20} />
+                                </div>
+                                <div>
+                                    <h2 className="text-lg font-bold text-white">Download Log</h2>
+                                    <p className="text-white/40 text-xs">Select a date</p>
+                                </div>
                             </div>
 
-                            <div className="flex justify-end">
-                                <button
-                                    onClick={() => setIsDateModalOpen(false)}
-                                    className="px-4 py-2 text-white/50 hover:text-white text-sm"
-                                >
-                                    Cancel
-                                </button>
+                            <div className="space-y-2 max-h-80 overflow-y-auto">
+                                {availableDates.map((item, index) => {
+                                    const dateStr = item.date || item;
+                                    const dateObj = new Date(dateStr + 'T00:00:00');
+                                    const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+                                    const monthDay = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                                    const hasErrors = item.errorCount > 0;
+                                    const isToday = index === 0;
+
+                                    return (
+                                        <button
+                                            key={dateStr}
+                                            onClick={() => {
+                                                window.open(`/api/streams/${id}/log?date=${dateStr}`, '_blank');
+                                                setIsDateModalOpen(false);
+                                            }}
+                                            className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all ${hasErrors
+                                                    ? 'bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20'
+                                                    : 'bg-white/5 hover:bg-white/10 border border-white/5'
+                                                }`}
+                                        >
+                                            <div className="flex items-center gap-3">
+                                                <div className={`w-2 h-2 rounded-full ${hasErrors ? 'bg-rose-400' : 'bg-emerald-400'}`} />
+                                                <div className="text-left">
+                                                    <div className="font-medium text-white">
+                                                        {monthDay}
+                                                        {isToday && <span className="ml-2 text-xs text-primary">(Today)</span>}
+                                                    </div>
+                                                    <div className="text-xs text-white/40">{dayName}</div>
+                                                </div>
+                                            </div>
+                                            <span className={`text-sm font-medium ${hasErrors ? 'text-rose-400' : 'text-emerald-400'}`}>
+                                                {hasErrors ? `${item.errorCount} errors` : 'Healthy'}
+                                            </span>
+                                        </button>
+                                    );
+                                })}
                             </div>
+
+                            <button
+                                onClick={() => setIsDateModalOpen(false)}
+                                className="w-full mt-4 py-2.5 text-white/50 hover:text-white text-sm font-medium rounded-lg hover:bg-white/5 transition-colors"
+                            >
+                                Cancel
+                            </button>
                         </div>
                     </div>
                 )}
@@ -448,8 +545,15 @@ const StreamDetail = () => {
                         <h3 className="text-xs font-bold text-cyan-400 uppercase tracking-wider mb-3 flex items-center gap-1"><Volume2 size={12} /> Audio</h3>
                         <div className="space-y-2 text-sm font-mono">
                             <div className="flex justify-between"><span className="text-white/50">Codec</span><span className="text-white">{stats.audio?.codec || '-'}</span></div>
-                            <div className="flex justify-between"><span className="text-white/50">Channels</span><span className="text-white">{stats.audio?.channels || '-'}</span></div>
+                            <div className="flex justify-between"><span className="text-white/50">Channels</span><span className="text-white">{stats.audio?.channelLayout || stats.audio?.channels || '-'}</span></div>
                             <div className="flex justify-between"><span className="text-white/50">Sample Rate</span><span className="text-white">{stats.audio?.sampleRate ? `${stats.audio.sampleRate}Hz` : '-'}</span></div>
+                            <div className="flex justify-between"><span className="text-white/50">Peak Level</span><span className={stats.audio?.isSilent ? 'text-amber-400' : 'text-white'}>{formatDbLevel(stats.audio?.peakDb)}</span></div>
+                            <div className="flex justify-between"><span className="text-white/50">Avg Level</span><span className="text-white">{formatDbLevel(stats.audio?.avgDb)}</span></div>
+                            {stats.audio?.isSilent && (
+                                <div className="mt-2 px-2 py-1 bg-amber-500/20 border border-amber-500/30 rounded text-amber-400 text-xs flex items-center gap-1">
+                                    <AlertTriangle size={12} /> Possible silence detected
+                                </div>
+                            )}
                         </div>
                     </div>
                     <div className="glass-panel p-4">

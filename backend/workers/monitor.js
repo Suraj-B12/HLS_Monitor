@@ -7,17 +7,114 @@ const { processSegment } = require('./processor');
 const { v4: uuidv4 } = require('uuid');
 
 const MONITOR_INTERVAL = 7000; // 7 seconds as requested
+const SLIDING_WINDOW_SIZE = 100; // Last 100 segments (~12 minutes)
 
-// Calculate health score (0-100)
-function calculateHealthScore(stream) {
+// Error decay factor based on time since last error
+// Returns a value 0-1 where 1 = full forgiveness, 0 = no forgiveness
+// Always returns a safe number, never throws
+function getErrorDecayFactor(lastErrorTime) {
+    try {
+        // No errors ever = full forgiveness
+        if (!lastErrorTime) return 1.0;
+
+        // Parse the date safely
+        const errorDate = new Date(lastErrorTime);
+        const errorTimestamp = errorDate.getTime();
+
+        // If parsing failed, assume no decay (be conservative)
+        if (isNaN(errorTimestamp)) return 0;
+
+        const hoursSinceError = (Date.now() - errorTimestamp) / (1000 * 60 * 60);
+
+        // Handle negative or invalid values (future dates, clock issues)
+        if (hoursSinceError < 0 || !isFinite(hoursSinceError)) return 0;
+
+        // Progressive forgiveness timeline
+        if (hoursSinceError < 1) return 0;        // First hour: Full penalty
+        if (hoursSinceError < 6) return 0.25;     // 1-6 hours: 25% forgiveness
+        if (hoursSinceError < 24) return 0.5;     // 6-24 hours: 50% forgiveness
+        if (hoursSinceError < 72) return 0.75;    // 1-3 days: 75% forgiveness
+        return 0.9;                                // 3+ days: 90% forgiveness
+    } catch (err) {
+        // On any error, return 0 (no forgiveness) to be conservative
+        return 0;
+    }
+}
+
+// Calculate sliding window metrics from recent streamErrors
+// Counts errors that occurred within the last WINDOW_MINUTES
+async function calculateSlidingWindowMetrics(streamId) {
+    const defaultResult = { jumps: 0, resets: 0, errors: 0 };
+
+    if (!streamId) return defaultResult;
+
+    try {
+        // Get stream with recent errors
+        const Stream = require('../models/Stream');
+        const stream = await Stream.findById(streamId).select('streamErrors').lean();
+
+        if (!stream || !stream.streamErrors) return defaultResult;
+
+        // Window: last 12 minutes (100 segments × ~7 seconds)
+        const windowStart = new Date(Date.now() - 12 * 60 * 1000);
+
+        // Filter errors within the window
+        const recentErrors = stream.streamErrors.filter(err => {
+            if (!err.date) return false;
+            return new Date(err.date) >= windowStart;
+        });
+
+        // Count by type
+        let jumps = 0;
+        let resets = 0;
+        let errors = 0;
+
+        recentErrors.forEach(err => {
+            errors++;
+            if (err.errorType === 'SEQUENCE_JUMP' ||
+                (err.details && err.details.includes('Sequence jumped'))) {
+                jumps++;
+            }
+            if (err.errorType === 'SEQUENCE_RESET' ||
+                (err.details && err.details.includes('reset'))) {
+                resets++;
+            }
+        });
+
+        return { jumps, resets, errors };
+    } catch (err) {
+        console.error(`[SLIDING] Error calculating metrics: ${err.message}`);
+        return defaultResult;
+    }
+}
+
+// Calculate health score (0-100) with sliding window + decay
+function calculateHealthScore(stream, recentIssues = null, decayFactor = 0) {
     let score = 100;
     const health = stream.health || {};
+
+    // Immediate penalties (current status)
     if (health.isStale) score -= 30;
-    if (health.sequenceJumps > 0) score -= Math.min(health.sequenceJumps * 5, 20);
-    if (health.sequenceResets > 0) score -= Math.min(health.sequenceResets * 10, 30);
-    if (health.totalErrors > 0) score -= Math.min(health.totalErrors * 2, 20);
     if (stream.status === 'error') score -= 40;
     if (stream.status === 'offline') score -= 50;
+
+    // If we have sliding window data, use it with decay
+    if (recentIssues) {
+        const effectiveDecay = 1 - decayFactor; // Convert forgiveness to penalty multiplier
+
+        // Apply penalties with decay factor
+        const jumpPenalty = Math.min(recentIssues.jumps * 5, 20) * effectiveDecay;
+        const resetPenalty = Math.min(recentIssues.resets * 10, 30) * effectiveDecay;
+        const errorPenalty = Math.min(recentIssues.errors * 2, 20) * effectiveDecay;
+
+        score -= (jumpPenalty + resetPenalty + errorPenalty);
+    } else {
+        // Fallback to all-time metrics (for backwards compatibility)
+        if (health.sequenceJumps > 0) score -= Math.min(health.sequenceJumps * 5, 20);
+        if (health.sequenceResets > 0) score -= Math.min(health.sequenceResets * 10, 30);
+        if (health.totalErrors > 0) score -= Math.min(health.totalErrors * 2, 20);
+    }
+
     return Math.max(0, Math.min(100, score));
 }
 
@@ -38,6 +135,8 @@ function calculateAudioScore(stream) {
     if (!audio) return 50;
     if (!audio.codec) score -= 20;
     if (audio.sampleRate && audio.sampleRate < 44100) score -= 10;
+    // Penalize if audio is silent
+    if (audio.isSilent) score -= 15;
     return Math.max(0, Math.min(100, score));
 }
 const streamState = new Map();
@@ -61,6 +160,7 @@ function addError(stream, errorType, details, mediaType = 'VIDEO', code = null) 
     stream.streamErrors.push(error);
     stream.health.totalErrors++;
     stream.health.timeSinceLastError = 0;
+    stream.health.lastErrorTime = new Date(); // Track for decay calculation
 
     console.log(`[ERROR] ${stream.name}: ${errorType} - ${details}`);
 }
@@ -190,12 +290,15 @@ async function checkStream(stream, io) {
         if (state.lastMediaSequence !== -1) {
             const expectedSequence = state.lastMediaSequence + 1;
 
-            // Check for sequence jump (gap)
+            // Check for sequence jump (gap) - only count significant gaps (3+)
+            // Gaps of 1-2 are normal due to poll timing (7s) vs segment duration (~6s)
             if (currentSequence > expectedSequence) {
                 const gap = currentSequence - expectedSequence;
-                stream.health.sequenceJumps++;
-                addError(stream, ErrorTypes.MEDIA_SEQUENCE,
-                    `Sequence jumped from ${state.lastMediaSequence} to ${currentSequence} (gap: ${gap})`);
+                if (gap >= 3) {
+                    stream.health.sequenceJumps++;
+                    addError(stream, ErrorTypes.MEDIA_SEQUENCE,
+                        `Sequence jumped from ${state.lastMediaSequence} to ${currentSequence} (gap: ${gap})`);
+                }
             }
 
             // Check for sequence reset
@@ -261,11 +364,20 @@ async function checkStream(stream, io) {
         const videoLevel = Math.min(100, Math.max(0, (videoBitrate / 5000000) * 100));
         const audioLevel = Math.min(100, Math.max(0, (audioBitrate / 320000) * 100));
 
+        // Calculate sliding window metrics + decay for health score
+        const recentIssues = await calculateSlidingWindowMetrics(stream._id);
+        const decayFactor = getErrorDecayFactor(stream.health.lastErrorTime);
+
+        // Update stream's recent metrics for frontend display
+        stream.health.recentErrors = recentIssues.errors;
+        stream.health.recentSequenceJumps = recentIssues.jumps;
+        stream.health.recentSequenceResets = recentIssues.resets;
+
         // Record metrics history for graphs (runs in background for ALL streams)
         try {
             await MetricsHistory.create({
                 streamId: stream._id,
-                healthScore: calculateHealthScore(stream),
+                healthScore: calculateHealthScore(stream, recentIssues, decayFactor),
                 videoScore: calculateVideoScore(stream),
                 audioScore: calculateAudioScore(stream),
                 videoBitrate: videoBitrate,
@@ -280,6 +392,15 @@ async function checkStream(stream, io) {
             });
         } catch (histErr) {
             console.error(`[METRICS] ${stream.name}: ${histErr.message}`);
+        }
+
+        // Save updated recent metrics to database
+        try {
+            await stream.save();
+        } catch (saveErr) {
+            if (saveErr.name !== 'VersionError') {
+                console.error(`[METRICS SAVE] ${stream.name}: ${saveErr.message}`);
+            }
         }
 
         io.emit('stream:update', stream);

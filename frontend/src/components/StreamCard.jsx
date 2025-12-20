@@ -21,15 +21,23 @@ const StreamCard = ({ stream, onDelete }) => {
     const current = statusConfig[stream.status] || statusConfig.offline;
     const health = stream.health || {};
 
-    // Calculate health score for color indicator
+    // Calculate health score - Based on status and recent SIGNIFICANT errors
     const calculateHealthScore = () => {
         let score = 100;
-        if (health.isStale) score -= 30;
-        if (health.sequenceJumps > 0) score -= Math.min(health.sequenceJumps * 5, 20);
-        if (health.sequenceResets > 0) score -= Math.min(health.sequenceResets * 10, 30);
-        if (health.totalErrors > 0) score -= Math.min(health.totalErrors * 2, 20);
-        if (stream.status === 'error') score -= 40;
-        if (stream.status === 'offline') score -= 50;
+
+        // Status penalties (hard caps)
+        if (stream.status === 'error') return 60;
+        if (stream.status === 'offline') return 50;
+        if (health.isStale) score -= 15;
+
+        // Recent errors penalty - now only counts significant gaps (3+)
+        // 0 errors = 100, 1-2 = 95-100, 3-5 = 85-95, 6+ = 70-85
+        const errors = health.recentErrors || 0;
+        if (errors > 0) {
+            // Each error costs 3 points, max penalty 30
+            score -= Math.min(errors * 3, 30);
+        }
+
         return Math.max(0, Math.min(100, score));
     };
 
