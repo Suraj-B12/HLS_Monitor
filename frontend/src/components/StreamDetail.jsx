@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import axios from 'axios';
@@ -187,37 +187,78 @@ const StreamDetail = () => {
     const [availableDates, setAvailableDates] = useState([]);
     const [loadingDates, setLoadingDates] = useState(false);
 
+    // Infinite Scroll State
+    const [hasMoreHistory, setHasMoreHistory] = useState(true);
+    const [loadingHistory, setLoadingHistory] = useState(false);
+
+    // Refs for scroll preservation
+    const videoChartRef = useRef(null);
+    const audioChartRef = useRef(null);
+    const prevScrollWidthRef = useRef(0);
+    const isPrependingRef = useRef(false);
+    const lastFetchTimeRef = useRef(0); // Cooldown timer
+    const ignoreScrollRef = useRef(false); // Ignore scroll during position restore
+
+    const fetchHistory = useCallback((skip = 0, isAppending = false) => {
+        // Cooldown: prevent fetches within 1.5 seconds of each other
+        const now = Date.now();
+        if (now - lastFetchTimeRef.current < 1500) return;
+
+        if (loadingHistory || (skip > 0 && !hasMoreHistory)) return;
+
+        lastFetchTimeRef.current = now;
+        setLoadingHistory(true);
+
+        if (isAppending) {
+            isPrependingRef.current = true;
+            if (videoChartRef.current) prevScrollWidthRef.current = videoChartRef.current.scrollWidth;
+        }
+
+        axios.get(`/api/streams/${id}/metrics?limit=300&skip=${skip}`)
+            .then(res => {
+                const data = res.data.data || res.data;
+                const hasMore = res.data.hasMore !== undefined ? res.data.hasMore : (data.length === 300);
+
+                setHasMoreHistory(hasMore);
+
+                const formatted = data.map(m => ({
+                    time: new Date(m.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+                    videoLevel: m.videoLevel || 0,
+                    audioLevel: m.audioLevel || 0,
+                    videoBitrate: m.videoBitrate ? (m.videoBitrate / 1000000) : 0,
+                    audioBitrate: m.audioBitrate ? (m.audioBitrate / 1000) : 0,
+                }));
+
+                setSignalHistory(prev => {
+                    if (isAppending) return [...formatted, ...prev];
+                    return formatted;
+                });
+
+                if (formatted.length > 0 && !isAppending) {
+                    const latest = data[data.length - 1];
+                    setLiveStats({
+                        videoLevel: formatted[formatted.length - 1].videoLevel,
+                        audioLevel: formatted[formatted.length - 1].audioLevel,
+                        videoBitrate: latest.videoBitrate || 0,
+                        audioBitrate: latest.audioBitrate || 0,
+                        fps: latest.fps || 0
+                    });
+                }
+                setLoadingHistory(false);
+            })
+            .catch(err => {
+                console.error(err);
+                setLoadingHistory(false);
+            });
+    }, [id, loadingHistory, hasMoreHistory]);
+
     useEffect(() => {
         axios.get(`/api/streams/${id}`)
             .then(res => { setStream(res.data); setLoading(false); })
             .catch(err => { console.error(err); setLoading(false); });
 
-        const loadHistory = () => {
-            axios.get(`/api/streams/${id}/metrics`)
-                .then(res => {
-                    const formatted = res.data.map(m => ({
-                        time: new Date(m.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-                        videoLevel: m.videoLevel || 0,
-                        audioLevel: m.audioLevel || 0,
-                        videoBitrate: m.videoBitrate ? (m.videoBitrate / 1000000) : 0,
-                        audioBitrate: m.audioBitrate ? (m.audioBitrate / 1000) : 0,
-                    }));
-                    setSignalHistory(formatted);
-                    if (formatted.length > 0) {
-                        const latest = res.data[res.data.length - 1];
-                        setLiveStats({
-                            videoLevel: formatted[formatted.length - 1].videoLevel,
-                            audioLevel: formatted[formatted.length - 1].audioLevel,
-                            videoBitrate: latest.videoBitrate || 0,
-                            audioBitrate: latest.audioBitrate || 0,
-                            fps: latest.fps || 0
-                        });
-                    }
-                })
-                .catch(err => console.error(err));
-        };
-
-        loadHistory();
+        // Initial Load
+        fetchHistory(0, false);
 
         const socket = io();
         socket.on('stream:signal', (data) => {
@@ -241,9 +282,47 @@ const StreamDetail = () => {
         socket.on('stream:update', (updated) => { if (updated._id === id) setStream(updated); });
         socket.on('stream:sprite', (data) => { if (data.id === id) setStream(prev => prev ? { ...prev, thumbnail: data.url } : prev); });
 
-        const historyInterval = setInterval(loadHistory, 30000);
-        return () => { socket.disconnect(); clearInterval(historyInterval); };
+        return () => { socket.disconnect(); };
     }, [id]);
+
+    // Restore scroll position after prepending data
+    useLayoutEffect(() => {
+        if (isPrependingRef.current) {
+            // Temporarily ignore scroll events during position restore
+            ignoreScrollRef.current = true;
+
+            if (videoChartRef.current) {
+                const newScrollWidth = videoChartRef.current.scrollWidth;
+                // Set to 100px from left to avoid immediate re-trigger
+                const newScrollLeft = Math.max(100, newScrollWidth - prevScrollWidthRef.current);
+                videoChartRef.current.scrollLeft = newScrollLeft;
+            }
+            if (audioChartRef.current) {
+                const newScrollLeft = Math.max(100, audioChartRef.current.scrollWidth - prevScrollWidthRef.current);
+                audioChartRef.current.scrollLeft = newScrollLeft;
+            }
+            isPrependingRef.current = false;
+
+            // Re-enable scroll handling after a short delay
+            setTimeout(() => { ignoreScrollRef.current = false; }, 300);
+        } else if (signalHistory.length > 0 && signalHistory.length <= 300) {
+            // Auto-scroll to right on initial load
+            setTimeout(() => {
+                if (videoChartRef.current) videoChartRef.current.scrollLeft = videoChartRef.current.scrollWidth;
+                if (audioChartRef.current) audioChartRef.current.scrollLeft = audioChartRef.current.scrollWidth;
+            }, 100);
+        }
+    }, [signalHistory.length]);
+
+    const handleScroll = (e) => {
+        // Skip if we're programmatically adjusting scroll
+        if (ignoreScrollRef.current) return;
+
+        const { scrollLeft } = e.target;
+        if (scrollLeft < 50 && !loadingHistory && hasMoreHistory) {
+            fetchHistory(signalHistory.length, true);
+        }
+    };
 
     const downloadLog = () => window.open(`/api/streams/${id}/log`, '_blank');
 
@@ -254,9 +333,6 @@ const StreamDetail = () => {
     const healthColor = getHealthColor(healthScore);
     const health = stream.health || {};
     const stats = stream.stats || {};
-
-    // Calculate chart width - 8px per data point, minimum 800px
-    const chartWidth = Math.max(800, signalHistory.length * 8);
 
     return (
         <div className="min-h-screen bg-surface text-white p-6">
@@ -312,55 +388,9 @@ const StreamDetail = () => {
                         Download Daily Log
                     </button>
 
-                    {/* Play Stream Button - Opens HLS player in new tab (client-side only) */}
+                    {/* Play Stream Button - Opens stream URL in new tab */}
                     <button
-                        onClick={() => {
-                            // Create a standalone HTML page with HLS.js player
-                            const playerHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>${stream.name} - HLS Player</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #0a0a0f; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        video { max-width: 100%; max-height: 100vh; background: #000; }
-        .error { color: #f87171; font-family: system-ui; text-align: center; padding: 2rem; }
-    </style>
-</head>
-<body>
-    <video id="video" controls autoplay></video>
-    <script>
-        const video = document.getElementById('video');
-        const url = '${stream.url}';
-        if (Hls.isSupported()) {
-            const hls = new Hls({
-                liveSyncDurationCount: 3,      // Start 3 segments from live edge
-                liveMaxLatencyDurationCount: 5 // Max 5 segments behind
-            });
-            hls.loadSource(url);
-            hls.attachMedia(video);
-            // Seek to live edge when manifest is loaded
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                video.currentTime = video.duration || 0;
-                video.play();
-            });
-            hls.on(Hls.Events.ERROR, (e, data) => {
-                if (data.fatal) document.body.innerHTML = '<div class="error">Failed to load stream: ' + data.details + '</div>';
-            });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = url;
-        } else {
-            document.body.innerHTML = '<div class="error">HLS not supported in this browser</div>';
-        }
-    </script>
-</body>
-</html>`;
-                            const blob = new Blob([playerHtml], { type: 'text/html' });
-                            const playerUrl = URL.createObjectURL(blob);
-                            window.open(playerUrl, '_blank');
-                        }}
+                        onClick={() => window.open(stream.url, '_blank')}
                         className="mb-8 px-6 py-3 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 rounded-lg text-emerald-400 font-bold flex items-center gap-2 transition-colors"
                     >
                         <Play size={18} />
@@ -399,8 +429,8 @@ const StreamDetail = () => {
                                                 setIsDateModalOpen(false);
                                             }}
                                             className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all ${hasErrors
-                                                    ? 'bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20'
-                                                    : 'bg-white/5 hover:bg-white/10 border border-white/5'
+                                                ? 'bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20'
+                                                : 'bg-white/5 hover:bg-white/10 border border-white/5'
                                                 }`}
                                         >
                                             <div className="flex items-center gap-3">
@@ -456,24 +486,29 @@ const StreamDetail = () => {
                     </div>
                 </div>
 
-                {/* SCROLLABLE SIGNAL HISTORY GRAPHS */}
+                {/* SIGNAL HISTORY GRAPHS */}
                 <div className="glass-panel p-6 mb-8">
                     <h3 className="text-lg font-bold mb-2 flex items-center gap-2">
                         <TrendingUp size={18} className="text-primary" />
-                        Signal History ({signalHistory.length} samples since start)
+                        Signal History (last {signalHistory.length} samples)
                     </h3>
                     <p className="text-white/40 text-sm mb-4">
-                        ← Scroll horizontally to see all data from the start. Data collected every 7 seconds. →
+                        Showing last {signalHistory.length} samples. Scroll left to load older history.
                     </p>
 
                     {signalHistory.length > 1 ? (
                         <div className="space-y-6">
                             {/* Video Bitrate Chart */}
                             <div>
-                                <h4 className="text-sm font-bold text-purple-400 mb-3">📊 Video Bitrate (Mbps)</h4>
-                                <div className="overflow-x-auto rounded-lg border border-white/10 bg-black/20" style={{ scrollbarWidth: 'thin' }}>
-                                    <div style={{ width: chartWidth, height: 180, padding: '10px 0' }}>
-                                        <AreaChart width={chartWidth} height={160} data={signalHistory} margin={{ top: 5, right: 20, left: 40, bottom: 5 }}>
+                                <h4 className="text-sm font-bold text-purple-400 mb-3">Video Bitrate (Mbps)</h4>
+                                <div
+                                    ref={videoChartRef}
+                                    onScroll={handleScroll}
+                                    className="overflow-x-auto rounded-lg border border-white/10 bg-black/20 scroll-smooth"
+                                    style={{ scrollbarWidth: 'thin' }}
+                                >
+                                    <div style={{ width: Math.max(700, signalHistory.length * 6), height: 180, padding: '10px 0' }}>
+                                        <AreaChart width={Math.max(700, signalHistory.length * 6)} height={160} data={signalHistory} margin={{ top: 5, right: 20, left: 40, bottom: 5 }}>
                                             <defs>
                                                 <linearGradient id="videoGrad" x1="0" y1="0" x2="0" y2="1">
                                                     <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.5} />
@@ -481,7 +516,13 @@ const StreamDetail = () => {
                                                 </linearGradient>
                                             </defs>
                                             <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                                            <XAxis dataKey="time" stroke="#666" tick={{ fill: '#888', fontSize: 9 }} interval={Math.max(1, Math.floor(signalHistory.length / 20))} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#666"
+                                                tick={{ fill: '#888', fontSize: 10 }}
+                                                interval={Math.floor(signalHistory.length / 8)}
+                                                tickFormatter={(val) => val.split(' ')[0]}
+                                            />
                                             <YAxis stroke="#666" tick={{ fill: '#888', fontSize: 10 }} />
                                             <Tooltip content={<CustomTooltip />} />
                                             <Area type="monotone" dataKey="videoBitrate" stroke="#8b5cf6" fill="url(#videoGrad)" strokeWidth={2} name="Video Bitrate" />
@@ -492,12 +533,23 @@ const StreamDetail = () => {
 
                             {/* Signal Strength Chart */}
                             <div>
-                                <h4 className="text-sm font-bold text-cyan-400 mb-3">📈 Signal Strength (%)</h4>
-                                <div className="overflow-x-auto rounded-lg border border-white/10 bg-black/20" style={{ scrollbarWidth: 'thin' }}>
-                                    <div style={{ width: chartWidth, height: 180, padding: '10px 0' }}>
-                                        <LineChart width={chartWidth} height={160} data={signalHistory} margin={{ top: 5, right: 20, left: 40, bottom: 5 }}>
+                                <h4 className="text-sm font-bold text-cyan-400 mb-3">Signal Strength (%)</h4>
+                                <div
+                                    ref={audioChartRef}
+                                    onScroll={handleScroll}
+                                    className="overflow-x-auto rounded-lg border border-white/10 bg-black/20 scroll-smooth"
+                                    style={{ scrollbarWidth: 'thin' }}
+                                >
+                                    <div style={{ width: Math.max(700, signalHistory.length * 6), height: 180, padding: '10px 0' }}>
+                                        <LineChart width={Math.max(700, signalHistory.length * 6)} height={160} data={signalHistory} margin={{ top: 5, right: 20, left: 40, bottom: 5 }}>
                                             <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                                            <XAxis dataKey="time" stroke="#666" tick={{ fill: '#888', fontSize: 9 }} interval={Math.max(1, Math.floor(signalHistory.length / 20))} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#666"
+                                                tick={{ fill: '#888', fontSize: 10 }}
+                                                interval={Math.floor(signalHistory.length / 8)}
+                                                tickFormatter={(val) => val.split(' ')[0]}
+                                            />
                                             <YAxis domain={[0, 100]} stroke="#666" tick={{ fill: '#888', fontSize: 10 }} />
                                             <Tooltip content={<CustomTooltip />} />
                                             <Legend />
@@ -507,7 +559,9 @@ const StreamDetail = () => {
                                     </div>
                                 </div>
                                 <div className="flex justify-between text-xs text-white/40 mt-2 px-2">
-                                    <span>← Oldest</span>
+                                    <span className={loadingHistory ? 'text-primary animate-pulse' : ''}>
+                                        {loadingHistory ? 'Loading older data...' : '← Scroll for history'}
+                                    </span>
                                     <span>Live →</span>
                                 </div>
                             </div>

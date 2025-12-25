@@ -420,12 +420,33 @@ app.get('/api/streams/:id/log', validateObjectId, async (req, res) => {
 
 // ===== METRICS HISTORY ROUTES =====
 
-// Get metrics history for a stream (for graphs) - returns ALL data from start
+// Get metrics history for a stream (for graphs) - last 100 entries
 app.get('/api/streams/:id/metrics', validateObjectId, async (req, res) => {
     try {
+        const limit = parseInt(req.query.limit) || 300;
+        const skip = parseInt(req.query.skip) || 0;
+
+        // Get total count (for hasMore flag)
+        const total = await MetricsHistory.countDocuments({ streamId: req.params.id });
+
+        // Get metrics sorted by timestamp descending (newest first)
         const metrics = await MetricsHistory.find({ streamId: req.params.id })
-            .sort({ timestamp: 1 });  // No limit - get all historical data
-        res.json(metrics);
+            .sort({ timestamp: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        // Reverse to chronological order (oldest -> newest) for charts
+        const chronologicalMetrics = metrics.reverse();
+
+        // Calculate hasMore based on total count
+        const hasMore = (skip + metrics.length) < total;
+
+        res.json({
+            data: chronologicalMetrics,
+            total,
+            hasMore
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
